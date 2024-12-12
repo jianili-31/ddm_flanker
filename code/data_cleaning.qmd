@@ -1,0 +1,215 @@
+---
+title: "Data Cleaning"
+author: "Janet Li"
+format: pdf
+---
+
+```{r}
+#| message: false
+library(tidyverse)
+```
+
+# Demographics
+
+```{r}
+MDD <- read_csv("MDD_all.csv", show_col_types = FALSE)
+flanker_all <- read_csv("compiled-flanker-data.csv", show_col_types = FALSE)
+# remove rows for test runs (i.e., where subject ID starts with 9)
+flanker_all <- flanker_all %>% filter(grepl('^[1-8]', subject_id))
+extra_IDs <- c(3963, 3970, 3981, 3983, 3985, 3989, 4002, 117)
+IDs_all <- c(flanker_all$subject_id, extra_IDs)
+# PARCS: UIC 15, USC 14
+MDD_CARS <- MDD %>% filter(ID %in% IDs_all)
+sum(MDD_CARS$MDDnew)
+```
+
+# Concatenate data across subjects for each task
+
+## Global Parameters
+
+```{r}
+study <- "PARC" # CAR or PARC
+school <- "USC"
+if (school == "UIC") {
+  basefolder <- paste0("../Examiner/individual_subjects/", study, "_", school, "_Examiner")
+} else {
+  if (study == "CAR") {
+    basefolder <- paste0("../../../", study, " Study/Data/Visit 2 Data")
+  } else {
+    basefolder <- paste0("../../../", study, " Study/Data/Visit 2")
+  }
+}
+```
+
+```{r}
+# no data: 
+# CARS UIC: 2959
+IDs <- list.files(basefolder)
+IDs <- IDs[nchar(IDs) < 5 & !is.na(as.integer(IDs))]
+IDs <- IDs[as.integer(IDs) < 8000]
+tasks <- c("Flanker", "NBack", "SetShifting")
+flanker <- c()
+nback <- c()
+setshifting <- c()
+no_data <- setNames(data.frame(matrix(ncol = 2, nrow = 0)), c("ID", "task"))
+
+for (id in IDs) {
+  print(paste0("Working on ", id))
+  folder <- paste0(basefolder, "/", id, "/Examiner")
+  if (id %in% list.files(folder)) {
+    folder <- paste0(folder, "/", id)
+  }
+  allfiles <- list.files(folder)
+  if (length(allfiles) == 0) {
+    print(paste0("No data for ", id, ", skipping them."))
+    no_data[nrow(no_data)+1, ] <- c(id, "all")
+    next
+  }
+  for (task in tasks) {
+    print(task)
+    filename <- allfiles[str_detect(allfiles, paste0(task, "_", id))]
+    if (length(filename) == 0) {
+      print(paste0("No ", task, " data for ", id, ", skipping them."))
+      no_data[nrow(no_data)+1, ] <- c(id, task)
+      next
+    }
+    data <- read_csv(paste0(folder, "/", filename), show_col_type = FALSE)
+    if (task == "Flanker") {
+      flanker <- rbind(flanker, data)
+    }
+    if (task == "NBack") {
+      nback <- rbind(nback, data)
+    }
+    if (task == "SetShifting") {
+      setshifting <- rbind(setshifting, data)
+    }
+  }
+  print(paste0(id, " finished."))
+}
+```
+
+```{r}
+flanker_filename <- paste0('../Examiner/all/', study, "_", school, "_flanker_all.csv")
+nback_filename <- paste0('../Examiner/all/', study, "_", school, "_nback_all.csv")
+setshifting_filename <- paste0('../Examiner/all/', study, "_", school, "_setshifting_all.csv")
+no_data_filename <- paste0('../Examiner/all/', study, '_', school, "_nodata.csv")
+
+write_csv(flanker, flanker_filename)
+write_csv(nback, nback_filename)
+write_csv(setshifting, setshifting_filename)
+write_csv(no_data, no_data_filename)
+```
+
+# Exclusion
+
+## Flanker
+
+Criteria from Dillon et al., 2015:
+1. log-transformed RT > mean log RT +- 3 SD (separately for congruent vs. incongruent)
+2. Participants who had >10% outlier trials
+
+```{r}
+schools <- c("UIC", "USC")
+studies <- c("CAR", "PARC")
+```
+
+```{r}
+task <- "flanker"
+
+for (school in schools) {
+  for (study in studies) {
+    print(paste0("Cleaning data for ", task, " in ", school, " ", study))
+    data <- read_csv(paste0("../data_all/", study, "_", school, "_", task, "_all.csv"),
+                     show_col_types = FALSE)
+    # Modify data
+    data <- data %>% 
+    # Factorize trial_congruent
+    mutate(trial_congruent_fac = factor(trial_congruent, levels = c(0, 1), 
+                                        labels = c("incongruent", "congruent"))) %>% 
+    # Only keep testing blocks
+    filter(block_name == "testingBlock") %>% 
+    # Select useful columns
+    select(subject_id, trial_congruent_fac, resp_corr, resp_rt, resp_value) %>% 
+    # Remove rows with missing RT
+    filter(!(resp_value == "none")) %>%
+    # Log-transform RT
+    mutate(log_rt = log(resp_rt)) %>% 
+    # Compute mean and SD of log-transformed RT
+    group_by(subject_id, trial_congruent_fac) %>% 
+    mutate(mean_log_rt = mean(log_rt, na.rm = TRUE), 
+           sd_log_rt = sd(log_rt, na.rm = TRUE)) %>% 
+    # Flag rows where 1) RT < 150ms; 2) >= +-3SD of mean log-transformed RT; 2) subjects who have >=10% of outlier trials
+    # BUT STILL KEEPING THE ROWS
+    mutate(exclude_trial = ifelse(between(log_rt, mean_log_rt-3*sd_log_rt, mean_log_rt+3*sd_log_rt) | resp_rt > .15, 0, 1)) %>%
+    mutate(exclude_part = ifelse(sum(exclude_trial == 1) >= 5, 1, 0)) %>% ungroup()
+    data_filename <- paste0('../data_all_cleaned/', study, "_", school, "_", task, "_cleaned.csv")
+    write_csv(data, data_filename)
+  }
+}
+
+# ggplot(data, aes(x = resp_rt, group = resp_corr)) +
+#   geom_density(aes(fill = factor(resp_corr), alpha = 0.5)) +
+#   facet_wrap(~trial_congruent_fac)
+```
+
+```{r}
+task <- "nback"
+
+for (school in schools) {
+  for (study in studies) {
+    print(paste0("Cleaning data for ", task, " in ", school, " ", study))
+    data <- read_csv(paste0("../Examiner/all/", study, "_", school, "_", task, "_all.csv"),
+                     show_col_types = FALSE)
+    # Modify data
+    data <- data %>% 
+    # Only keep testing blocks
+    filter(block_name %in% c("nb1TestingBlock", "nb2TestingBlock") & resp_rt != 0) %>% 
+    # Select useful columns
+    select(subject_id, block_name, trial_location, trial_similarity, 
+           trial_corr_resp, resp_corr, resp_rt, resp_value) %>% 
+    # Compute mean and SD of RT
+    group_by(subject_id, block_name) %>% 
+    mutate(mean_rt = mean(resp_rt, na.rm = TRUE), 
+           sd_rt = sd(resp_rt, na.rm = TRUE), 
+           # Threshold for excluding a participant: 10% of trials in each condition are outliers
+           exclude_thresh = 0.1*n()) %>% 
+    # Flag rows that 1) >= +-3SD of RT; 2) subjects who have >=10% of outlier trials
+    # BUT STILL KEEPING THE ROWS
+    mutate(exclude_trial = ifelse(between(resp_rt, mean_rt-3*sd_rt, mean_rt+3*sd_rt), 0, 1)) %>%
+    mutate(exclude_part = ifelse(sum(exclude_trial == 1) >= exclude_thresh, 1, 0)) %>% ungroup()
+    data_filename <- paste0('../Examiner/all_cleaned/', study, "_", school, "_", task, "_cleaned.csv")
+    write_csv(data, data_filename)
+  }
+}
+```
+
+```{r}
+task <- "setshifting"
+
+for (school in schools) {
+  for (study in studies) {
+    print(paste0("Cleaning data for ", task, " in ", school, " ", study))
+    data <- read_csv(paste0("../Examiner/all/", study, "_", school, "_", task, "_all.csv"),
+                     show_col_types = FALSE)
+    # Modify data
+    data <- data %>% 
+    # Only keep testing blocks
+    filter(block_name == "testingBlock") %>% 
+    # Select useful columns
+    select(subject_id, trial_condition, trial_cue, 
+           trial_corr_resp, trial_shift, resp_corr, resp_rt, resp_value) %>% 
+    # Compute mean and SD of RT
+    group_by(subject_id, trial_condition) %>% 
+    mutate(mean_rt = mean(resp_rt, na.rm = TRUE), 
+           sd_rt = sd(resp_rt, na.rm = TRUE),
+           # Threshold for excluding a participant: 10% of trials in each condition (color, shape, shift) are outliers
+           exclude_thresh = 0.1*n()) %>% 
+    # Flag rows that 1) >= +-3SD of RT; 2) subjects who have >=10% of outlier trials
+    # BUT STILL KEEPING THE ROWS
+    mutate(exclude_trial = ifelse(between(resp_rt, mean_rt-3*sd_rt, mean_rt+3*sd_rt), 0, 1)) %>%
+    mutate(exclude_part = ifelse(sum(exclude_trial == 1) >= exclude_thresh, 1, 0)) %>% ungroup()
+    data_filename <- paste0('../Examiner/all_cleaned/', study, "_", school, "_", task, "_cleaned.csv")
+    write_csv(data, data_filename)
+  }
+}
+```
